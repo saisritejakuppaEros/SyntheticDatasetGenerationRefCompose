@@ -1,0 +1,3 @@
+[submodule "external/LoMa"]
+	path = external/LoMa
+	url = https://github.com/davnords/LoMa.git
