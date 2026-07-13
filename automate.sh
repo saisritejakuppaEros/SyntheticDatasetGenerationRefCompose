@@ -13,12 +13,12 @@
 # export NCCL_TIMEOUT=1800
 # export NCCL_DEBUG=WARN
 # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-# uv run vllm serve Qwen/Qwen3-VL-8B-Instruct-FP8 \
-#   --tensor-parallel-size 1 \
-#   --data-parallel-size 6 \
-#   --limit-mm-per-prompt.video 0 \
-#   --gpu-memory-utilization 0.95 \
-#   --enforce-eager
+uv run vllm serve Qwen/Qwen3-VL-8B-Instruct-FP8 \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 1 \
+  --limit-mm-per-prompt.video 0 \
+  --gpu-memory-utilization 0.95 \
+  --enforce-eager
 
 cd /mnt/data0/teja/research_multiref/synthetic_dataset_generation
 source .venv/bin/activate
