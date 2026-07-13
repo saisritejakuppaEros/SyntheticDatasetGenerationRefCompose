@@ -3,7 +3,7 @@
 flux2_imagegen.py
 
 Reads theme prompts from manifest.jsonl (v2 theme_prompt_composer output) and
-generates one FLUX.2 image per unique theme using each sample's combined_prompt.
+generates one FLUX.2 image per manifest row using each sample's combined_prompt.
 
 Typical usage:
 
@@ -32,7 +32,7 @@ DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "outputs/theme_images"
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Generate one FLUX.2 image per unique theme from theme_prompts manifest."
+        description="Generate FLUX.2 images for every row in the theme_prompts manifest."
     )
     p.add_argument(
         "--manifest",
@@ -96,13 +96,13 @@ def parse_args():
         "--seed",
         type=int,
         default=42,
-        help="Base seed. Per-theme seed is derived from this + theme name.",
+        help="Base seed. Per-sample seed is derived from this + sample id.",
     )
     p.add_argument(
         "--skip_existing",
         action="store_true",
         default=True,
-        help="Skip themes whose output image already exists (default: True).",
+        help="Skip samples whose output image already exists (default: True).",
     )
     p.add_argument(
         "--no_skip_existing",
@@ -133,19 +133,8 @@ def load_manifest(manifest_path):
     return samples
 
 
-def pick_one_per_theme(samples):
-    """Return one sample per unique theme (first occurrence in manifest order)."""
-    seen = {}
-    for sample in samples:
-        theme = sample.get("theme")
-        if not theme or theme in seen:
-            continue
-        seen[theme] = sample
-    return list(seen.values())
-
-
-def theme_seed(base_seed, theme):
-    return (base_seed + sum(ord(c) for c in theme)) % (2**31 - 1)
+def sample_seed(base_seed, sample_id):
+    return (base_seed + sum(ord(c) for c in sample_id)) % (2**31 - 1)
 
 
 def build_pipeline(args):
@@ -212,41 +201,39 @@ def main():
     meta_out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading manifest: {manifest_path}")
-    all_samples = load_manifest(manifest_path)
-    theme_samples = pick_one_per_theme(all_samples)
-    theme_samples.sort(key=lambda s: s.get("theme", ""))
+    samples = load_manifest(manifest_path)
+    samples.sort(key=lambda s: s.get("id", ""))
 
-    print(f"Total manifest samples: {len(all_samples)}")
-    print(f"Unique themes to generate: {len(theme_samples)}")
-    for sample in theme_samples:
-        print(f"  - {sample['theme']}: {sample['id']}")
+    print(f"Samples to generate: {len(samples)}")
+    for sample in samples:
+        print(f"  - {sample.get('id', '?')} ({sample.get('theme', '?')})")
 
     pipe = build_pipeline(args)
 
     n_done, n_skipped, n_failed = 0, 0, 0
     t_start = time.time()
 
-    for sample in theme_samples:
+    for sample in samples:
         sample_id = sample.get("id", "unknown")
         theme = sample.get("theme", "unknown")
         prompt = (sample.get("combined_prompt") or "").strip()
 
-        out_img_path = img_out_dir / f"{theme}.png"
-        out_meta_path = meta_out_dir / f"{theme}.json"
+        out_img_path = img_out_dir / f"{sample_id}.png"
+        out_meta_path = meta_out_dir / f"{sample_id}.json"
 
         if not prompt:
-            print(f"[{theme}] SKIP: missing combined_prompt for {sample_id}")
+            print(f"[{sample_id}] SKIP: missing combined_prompt")
             n_failed += 1
             continue
 
         if args.skip_existing and out_img_path.exists():
-            print(f"[{theme}] SKIP: already exists ({out_img_path.name})")
+            print(f"[{sample_id}] SKIP: already exists ({out_img_path.name})")
             n_skipped += 1
             continue
 
         try:
-            sample_seed = theme_seed(args.seed, theme)
-            generator = torch.Generator(device="cpu").manual_seed(sample_seed)
+            seed = sample_seed(args.seed, sample_id)
+            generator = torch.Generator(device="cpu").manual_seed(seed)
 
             result = pipe(
                 prompt=prompt,
@@ -269,7 +256,7 @@ def main():
                         "object_details": sample.get("object_details", []),
                         "prompt": prompt,
                         "structured_prompt": sample.get("structured_prompt"),
-                        "seed": sample_seed,
+                        "seed": seed,
                         "guidance_scale": args.guidance_scale,
                         "num_inference_steps": args.num_inference_steps,
                         "gen_width": args.width,
@@ -283,11 +270,11 @@ def main():
                 )
 
             n_done += 1
-            print(f"[{theme}] saved {out_img_path.name} (from {sample_id})")
+            print(f"[{sample_id}] saved {out_img_path.name} ({theme})")
 
         except Exception as e:
             n_failed += 1
-            print(f"[{theme}] ERROR ({sample_id}): {e}", file=sys.stderr)
+            print(f"[{sample_id}] ERROR: {e}", file=sys.stderr)
             traceback.print_exc()
             continue
 

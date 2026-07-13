@@ -10,6 +10,6 @@
 4. gdino the images and then cross verify it.
 5. do the inference on them
 
-python objects.py --total 10000 
+python objects.py --total 50
 python flux2_imagegen.py
 python bbox_annotation.py

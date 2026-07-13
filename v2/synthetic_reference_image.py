@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
 """
-synthetic_ref_image.py
+synthetic_reference_image.py
 
-Stage 3 of the pipeline: takes bbox_annotation.py's output (per-theme
-metadata with a bounding box for each of the theme's objects, located inside
-the full scene image) and turns every detected box into a clean, isolated,
-high-resolution *reference image* of just that object:
+Stage 3 of the pipeline: takes bbox_annotation.py's output (per-sample
+metadata with a bounding box for each object in the scene image) and turns
+every detected box into a clean, isolated, high-resolution *reference image*
+of just that object:
 
   - Crops the object out of the scene using its bbox (with a little padding
     so the model gets some context and isn't fed a razor-tight sliver).
   - Feeds that crop into FLUX.2 as a reference/conditioning image and
     re-generates it as a neutral, front-facing, non-tilted product shot on a
     pure white background, at 1024x1024.
-  - Writes one file per detected object, organized by theme:
+  - Writes one file per detected object, organized by sample id:
 
-        outputs/reference_images/<theme>/bbox1.jpg
-        outputs/reference_images/<theme>/bbox2.jpg
+        outputs/reference_images/<sample_id>/bbox1.jpg
+        outputs/reference_images/<sample_id>/bbox2.jpg
         ...
-        outputs/reference_images/<theme>/bbox1.json   (sidecar metadata)
+        outputs/reference_images/<sample_id>/bbox1.json   (sidecar metadata)
 
-    The numeric suffix matches the object's position in that theme's
+    The numeric suffix matches the object's position in that sample's
     `objects` list from the bbox metadata, so bbox1.jpg is always the same
     object across runs.
 
 Typical usage:
 
-    CUDA_VISIBLE_DEVICES=0 python synthetic_ref_image.py
+    CUDA_VISIBLE_DEVICES=0 python synthetic_reference_image.py
 
-    # Single theme, smaller GPU:
-    CUDA_VISIBLE_DEVICES=0 python synthetic_ref_image.py --theme action --quantized
+    # Single sample, smaller GPU:
+    CUDA_VISIBLE_DEVICES=0 python synthetic_reference_image.py --theme home_office_000024 --quantized
 
     # Re-run everything, including files that already exist:
-    CUDA_VISIBLE_DEVICES=0 python synthetic_ref_image.py --no_skip_existing
+    CUDA_VISIBLE_DEVICES=0 python synthetic_reference_image.py --no_skip_existing
 
 Notes:
   - Requires bbox_annotation.py to have already been run (reads its metadata
@@ -87,7 +87,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default=str(DEFAULT_OUTPUT_DIR),
-        help="Root directory for generated reference images (organized by theme subfolder).",
+        help="Root directory for generated reference images (organized by sample-id subfolder).",
     )
     p.add_argument(
         "--model_id",
@@ -123,7 +123,12 @@ def parse_args():
         help="Skip detections with bbox_score below this (0 = keep all found boxes).",
     )
     p.add_argument("--seed", type=int, default=42, help="Base seed; per-object seed derived from this + id.")
-    p.add_argument("--theme", type=str, default=None, help="Process only this theme (metadata filename stem).")
+    p.add_argument(
+        "--theme",
+        type=str,
+        default=None,
+        help="Process only this sample (bbox metadata filename stem, e.g. home_office_000024).",
+    )
     p.add_argument(
         "--skip_existing",
         action="store_true",
@@ -236,7 +241,7 @@ def generate_reference_image(pipe, ref_crop: Image.Image, label: str, args, seed
 
 
 # ----------------------------------------------------------------------------
-# Per-theme processing
+# Per-sample processing
 # ----------------------------------------------------------------------------
 
 def load_bbox_metadata(path: Path) -> dict:
@@ -244,43 +249,44 @@ def load_bbox_metadata(path: Path) -> dict:
         return json.load(f)
 
 
-def process_theme(meta_path: Path, pipe, args):
+def process_sample(meta_path: Path, pipe, args):
     meta = load_bbox_metadata(meta_path)
-    theme = meta.get("theme", meta_path.stem)
+    sample_id = meta.get("id", meta_path.stem)
+    theme = meta.get("theme", "unknown")
 
     source_image_path = Path(meta.get("source_image") or "")
     if not source_image_path.is_file():
-        raise FileNotFoundError(f"[{theme}] source scene image not found: {source_image_path}")
+        raise FileNotFoundError(f"[{sample_id}] source scene image not found: {source_image_path}")
 
     scene_image = Image.open(source_image_path).convert("RGB")
 
     objects = meta.get("bbox_information", {}).get("objects", [])
     if not objects:
-        raise ValueError(f"[{theme}] no bbox_information.objects in {meta_path}")
+        raise ValueError(f"[{sample_id}] no bbox_information.objects in {meta_path}")
 
-    theme_out_dir = Path(args.output_dir) / theme
-    theme_out_dir.mkdir(parents=True, exist_ok=True)
+    sample_out_dir = Path(args.output_dir) / sample_id
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
 
     n_done, n_skipped, n_failed = 0, 0, 0
 
     for idx, obj_entry in enumerate(objects, start=1):
         object_name = obj_entry.get("object", f"object_{idx}")
-        out_img_path = theme_out_dir / f"bbox{idx}.jpg"
-        out_meta_path = theme_out_dir / f"bbox{idx}.json"
+        out_img_path = sample_out_dir / f"bbox{idx}.jpg"
+        out_meta_path = sample_out_dir / f"bbox{idx}.json"
 
         if args.skip_existing and out_img_path.is_file():
-            print(f"[{theme}] bbox{idx} ({object_name}): SKIP, already exists")
+            print(f"[{sample_id}] bbox{idx} ({object_name}): SKIP, already exists")
             n_skipped += 1
             continue
 
         if not obj_entry.get("found"):
-            print(f"[{theme}] bbox{idx} ({object_name}): SKIP, not detected in scene")
+            print(f"[{sample_id}] bbox{idx} ({object_name}): SKIP, not detected in scene")
             n_skipped += 1
             continue
 
         score = obj_entry.get("score")
         if score is not None and score < args.min_score:
-            print(f"[{theme}] bbox{idx} ({object_name}): SKIP, score {score:.3f} < {args.min_score}")
+            print(f"[{sample_id}] bbox{idx} ({object_name}): SKIP, score {score:.3f} < {args.min_score}")
             n_skipped += 1
             continue
 
@@ -292,11 +298,11 @@ def process_theme(meta_path: Path, pipe, args):
             crop = crop_object(scene_image, bbox, args.pad_frac)
 
             if args.save_debug_crops:
-                debug_path = theme_out_dir / f"bbox{idx}_crop.jpg"
+                debug_path = sample_out_dir / f"bbox{idx}_crop.jpg"
                 square_pad_white(crop).save(debug_path, quality=args.jpg_quality)
 
-            sample_id = f"{theme}_bbox{idx}"
-            seed = object_seed(args.seed, sample_id)
+            seed_key = f"{sample_id}_bbox{idx}"
+            seed = object_seed(args.seed, seed_key)
 
             ref_image = generate_reference_image(pipe, crop, object_name, args, seed)
             if ref_image.size != (REF_SIZE, REF_SIZE):
@@ -307,6 +313,7 @@ def process_theme(meta_path: Path, pipe, args):
             with open(out_meta_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
+                        "id": sample_id,
                         "theme": theme,
                         "bbox_index": idx,
                         "object": object_name,
@@ -330,11 +337,11 @@ def process_theme(meta_path: Path, pipe, args):
                 )
 
             n_done += 1
-            print(f"[{theme}] bbox{idx} ({object_name}): saved -> {out_img_path.name}")
+            print(f"[{sample_id}] bbox{idx} ({object_name}): saved -> {out_img_path.name}")
 
         except Exception as e:
             n_failed += 1
-            print(f"[{theme}] bbox{idx} ({object_name}): ERROR: {e}", file=sys.stderr)
+            print(f"[{sample_id}] bbox{idx} ({object_name}): ERROR: {e}", file=sys.stderr)
             traceback.print_exc()
             continue
 
@@ -353,12 +360,16 @@ def main():
     if args.theme:
         meta_paths = [bbox_metadata_dir / f"{args.theme}.json"]
         if not meta_paths[0].is_file():
-            print(f"ERROR: bbox metadata not found for theme: {args.theme}", file=sys.stderr)
+            print(f"ERROR: bbox metadata not found for sample: {args.theme}", file=sys.stderr)
             sys.exit(1)
 
     if not meta_paths:
         print(f"ERROR: no bbox metadata JSON files found in {bbox_metadata_dir}", file=sys.stderr)
         sys.exit(1)
+
+    print(f"Samples to process: {len(meta_paths)}")
+    for meta_path in meta_paths:
+        print(f"  - {meta_path.stem}")
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -368,14 +379,15 @@ def main():
     t_start = time.time()
 
     for meta_path in meta_paths:
+        sample_id = meta_path.stem
         try:
-            n_done, n_skipped, n_failed = process_theme(meta_path, pipe, args)
+            n_done, n_skipped, n_failed = process_sample(meta_path, pipe, args)
             total_done += n_done
             total_skipped += n_skipped
             total_failed += n_failed
         except Exception as e:
             total_failed += 1
-            print(f"[{meta_path.stem}] ERROR: {e}", file=sys.stderr)
+            print(f"[{sample_id}] ERROR: {e}", file=sys.stderr)
             traceback.print_exc()
             continue
 
