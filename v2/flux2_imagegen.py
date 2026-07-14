@@ -5,14 +5,28 @@ flux2_imagegen.py
 Reads theme prompts from manifest.jsonl (v2 theme_prompt_composer output) and
 generates one FLUX.2 image per manifest row using each sample's combined_prompt.
 
-Typical usage:
+Designed to be launched once PER GPU. Each launch is told:
+  --shard_id      which shard this process handles (0-indexed)
+  --num_shards    total number of shards/GPUs (default: 6)
 
-    CUDA_VISIBLE_DEVICES=0 python flux2_imagegen.py \
-        --manifest outputs/theme_prompts/manifest.jsonl \
-        --output_dir outputs/theme_images
+Samples are assigned via `index % num_shards == shard_id`, so you can safely
+run 6 independent processes in parallel and they will never touch the same sample.
+
+Typical usage (6 GPUs, one process per GPU):
+
+    # shard 0 on GPU 1, shards 1-5 on GPUs 2-6
+    CUDA_VISIBLE_DEVICES=1 python flux2_imagegen.py --shard_id 0 --num_shards 6
+    CUDA_VISIBLE_DEVICES=2 python flux2_imagegen.py --shard_id 1 --num_shards 6
+    CUDA_VISIBLE_DEVICES=3 python flux2_imagegen.py --shard_id 2 --num_shards 6
+    CUDA_VISIBLE_DEVICES=4 python flux2_imagegen.py --shard_id 3 --num_shards 6
+    CUDA_VISIBLE_DEVICES=5 python flux2_imagegen.py --shard_id 4 --num_shards 6
+    CUDA_VISIBLE_DEVICES=6 python flux2_imagegen.py --shard_id 5 --num_shards 6
+
+    # Or launch all 6 at once:
+    bash run_flux2_imagegen.sh
 
     # Smaller GPUs:
-    CUDA_VISIBLE_DEVICES=0 python flux2_imagegen.py --quantized
+    CUDA_VISIBLE_DEVICES=1 python flux2_imagegen.py --shard_id 0 --num_shards 6 --quantized
 """
 
 import argparse
@@ -45,6 +59,18 @@ def parse_args():
         type=str,
         default=str(DEFAULT_OUTPUT_DIR),
         help="Where to write generated images + sidecar metadata.",
+    )
+    p.add_argument(
+        "--shard_id",
+        type=int,
+        default=0,
+        help="0-indexed shard/GPU id this process handles.",
+    )
+    p.add_argument(
+        "--num_shards",
+        type=int,
+        default=6,
+        help="Total number of shards/GPUs (default: 6).",
     )
     p.add_argument(
         "--model_id",
@@ -99,6 +125,12 @@ def parse_args():
         help="Base seed. Per-sample seed is derived from this + sample id.",
     )
     p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional cap on number of samples this shard will process (smoke testing).",
+    )
+    p.add_argument(
         "--skip_existing",
         action="store_true",
         default=True,
@@ -133,6 +165,10 @@ def load_manifest(manifest_path):
     return samples
 
 
+def shard_samples(samples, shard_id, num_shards):
+    return [s for idx, s in enumerate(samples) if idx % num_shards == shard_id]
+
+
 def sample_seed(base_seed, sample_id):
     return (base_seed + sum(ord(c) for c in sample_id)) % (2**31 - 1)
 
@@ -150,7 +186,7 @@ def build_pipeline(args):
         from transformers import Mistral3ForConditionalGeneration
 
         repo_id = args.model_id if "bnb-4bit" in args.model_id else "diffusers/FLUX.2-dev-bnb-4bit"
-        print(f"Loading quantized FLUX.2 ({repo_id}) ...")
+        print(f"[shard {args.shard_id}] Loading quantized FLUX.2 ({repo_id}) ...")
 
         transformer = Flux2Transformer2DModel.from_pretrained(
             repo_id,
@@ -175,7 +211,7 @@ def build_pipeline(args):
     else:
         from diffusers import Flux2Pipeline
 
-        print(f"Loading pipeline {args.model_id} (dtype={args.dtype}) ...")
+        print(f"[shard {args.shard_id}] Loading pipeline {args.model_id} (dtype={args.dtype}) ...")
         pipe = Flux2Pipeline.from_pretrained(args.model_id, torch_dtype=torch_dtype)
 
         if args.enable_cpu_offload:
@@ -200,20 +236,22 @@ def main():
     img_out_dir.mkdir(parents=True, exist_ok=True)
     meta_out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading manifest: {manifest_path}")
-    samples = load_manifest(manifest_path)
-    samples.sort(key=lambda s: s.get("id", ""))
+    print(f"[shard {args.shard_id}/{args.num_shards}] Loading manifest: {manifest_path}")
+    all_samples = load_manifest(manifest_path)
+    all_samples.sort(key=lambda s: s.get("id", ""))
+    print(f"[shard {args.shard_id}/{args.num_shards}] Total samples in manifest: {len(all_samples)}")
 
-    print(f"Samples to generate: {len(samples)}")
-    for sample in samples:
-        print(f"  - {sample.get('id', '?')} ({sample.get('theme', '?')})")
+    my_samples = shard_samples(all_samples, args.shard_id, args.num_shards)
+    if args.limit is not None:
+        my_samples = my_samples[: args.limit]
+    print(f"[shard {args.shard_id}/{args.num_shards}] Samples assigned to this shard: {len(my_samples)}")
 
     pipe = build_pipeline(args)
 
     n_done, n_skipped, n_failed = 0, 0, 0
     t_start = time.time()
 
-    for sample in samples:
+    for sample in my_samples:
         sample_id = sample.get("id", "unknown")
         theme = sample.get("theme", "unknown")
         prompt = (sample.get("combined_prompt") or "").strip()
@@ -222,12 +260,11 @@ def main():
         out_meta_path = meta_out_dir / f"{sample_id}.json"
 
         if not prompt:
-            print(f"[{sample_id}] SKIP: missing combined_prompt")
+            print(f"[shard {args.shard_id}] [{sample_id}] SKIP: missing combined_prompt")
             n_failed += 1
             continue
 
         if args.skip_existing and out_img_path.exists():
-            print(f"[{sample_id}] SKIP: already exists ({out_img_path.name})")
             n_skipped += 1
             continue
 
@@ -270,17 +307,24 @@ def main():
                 )
 
             n_done += 1
-            print(f"[{sample_id}] saved {out_img_path.name} ({theme})")
+            if n_done % 5 == 0:
+                elapsed = time.time() - t_start
+                rate = n_done / elapsed if elapsed > 0 else 0
+                print(
+                    f"[shard {args.shard_id}] progress: {n_done} done, "
+                    f"{n_skipped} skipped, {n_failed} failed ({rate:.3f} img/s)"
+                )
 
         except Exception as e:
             n_failed += 1
-            print(f"[{sample_id}] ERROR: {e}", file=sys.stderr)
+            print(f"[shard {args.shard_id}] [{sample_id}] ERROR: {e}", file=sys.stderr)
             traceback.print_exc()
             continue
 
     elapsed = time.time() - t_start
     print(
-        f"DONE. generated={n_done} skipped={n_skipped} failed={n_failed} "
+        f"[shard {args.shard_id}/{args.num_shards}] DONE. "
+        f"generated={n_done} skipped={n_skipped} failed={n_failed} "
         f"elapsed={elapsed:.1f}s"
     )
 

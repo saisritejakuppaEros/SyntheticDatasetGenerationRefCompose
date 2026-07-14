@@ -26,18 +26,24 @@ Typical usage:
 
     # Re-run everything, including files that already exist:
     python canvas_generation.py --no_skip_existing
+
+    # Use more parallel workers:
+    python canvas_generation.py --threads 16
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -46,6 +52,7 @@ DEFAULT_REFERENCE_DIR = SCRIPT_DIR / "outputs/reference_images"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "outputs/canvas"
 
 DEFAULT_WHITE_THRESHOLD = 240
+DEFAULT_NUM_THREADS = min(16, os.cpu_count() or 8)
 
 
 def parse_args():
@@ -88,6 +95,12 @@ def parse_args():
         type=int,
         default=DEFAULT_WHITE_THRESHOLD,
         help="RGB channels >= this value are treated as transparent reference background.",
+    )
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=DEFAULT_NUM_THREADS,
+        help=f"Number of parallel worker threads (default: {DEFAULT_NUM_THREADS}).",
     )
     return p.parse_args()
 
@@ -194,7 +207,7 @@ def build_canvas(
     return canvas
 
 
-def process_sample(meta_path: Path, args) -> tuple[int, int]:
+def process_sample(meta_path: Path, args) -> tuple[int, int, str, str | None]:
     bbox_meta = load_json(meta_path)
     sample_id = bbox_meta.get("id", meta_path.stem)
     theme = bbox_meta.get("theme", "unknown")
@@ -208,13 +221,11 @@ def process_sample(meta_path: Path, args) -> tuple[int, int]:
     out_meta_path = out_meta_dir / f"{sample_id}.json"
 
     if args.skip_existing and out_img_path.is_file() and out_meta_path.is_file():
-        print(f"[{sample_id}] SKIP, canvas already exists")
-        return 0, 1
+        return 0, 1, sample_id, "canvas already exists"
 
     placements = collect_placements(bbox_meta, Path(args.reference_dir))
     if not placements:
-        print(f"[{sample_id}] SKIP, no reference placements found")
-        return 0, 1
+        return 0, 1, sample_id, "no reference placements found"
 
     canvas = build_canvas(bbox_meta, placements, args)
     canvas.save(out_img_path)
@@ -237,10 +248,14 @@ def process_sample(meta_path: Path, args) -> tuple[int, int]:
     with open(out_meta_path, "w", encoding="utf-8") as f:
         json.dump(canvas_meta, f, indent=2, ensure_ascii=False)
 
-    print(
-        f"[{sample_id}] saved canvas with {len(placements)} placements -> {out_img_path.name}"
-    )
-    return 1, 0
+    return 1, 0, sample_id, f"saved canvas with {len(placements)} placements -> {out_img_path.name}"
+
+
+def process_sample_safe(meta_path: Path, args) -> tuple[int, int, str, str | None]:
+    try:
+        return process_sample(meta_path, args)
+    except Exception as e:
+        return 0, 0, meta_path.stem, f"ERROR: {e}"
 
 
 def main():
@@ -262,9 +277,7 @@ def main():
         print(f"ERROR: no bbox metadata JSON files found in {bbox_metadata_dir}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Samples to process: {len(meta_paths)}")
-    for meta_path in meta_paths:
-        print(f"  - {meta_path.stem}")
+    print(f"Samples to process: {len(meta_paths)} (threads={args.threads})")
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -272,19 +285,34 @@ def main():
     total_failed = 0
     t_start = time.time()
 
-    for meta_path in meta_paths:
-        sample_id = meta_path.stem
-        try:
-            n_done, n_skipped = process_sample(meta_path, args)
-            total_done += n_done
-            total_skipped += n_skipped
-        except Exception as e:
-            total_failed += 1
-            print(f"[{sample_id}] ERROR: {e}", file=sys.stderr)
-            continue
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = {
+            executor.submit(process_sample_safe, meta_path, args): meta_path
+            for meta_path in meta_paths
+        }
+        with tqdm(total=len(meta_paths), desc="Generating canvases", unit="sample") as pbar:
+            for future in as_completed(futures):
+                n_done, n_skipped, sample_id, detail = future.result()
+                total_done += n_done
+                total_skipped += n_skipped
+
+                if detail:
+                    if detail.startswith("ERROR:"):
+                        total_failed += 1
+                        tqdm.write(f"[{sample_id}] {detail}", file=sys.stderr)
+                    elif n_done:
+                        tqdm.write(f"[{sample_id}] {detail}")
+
+                pbar.update(1)
+                pbar.set_postfix(
+                    done=total_done,
+                    skip=total_skipped,
+                    fail=total_failed,
+                    refresh=False,
+                )
 
     elapsed = time.time() - t_start
-    print(
+    tqdm.write(
         f"DONE. generated={total_done} skipped={total_skipped} failed={total_failed} "
         f"output_dir={args.output_dir} elapsed={elapsed:.1f}s"
     )

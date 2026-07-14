@@ -26,6 +26,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
+from tqdm import tqdm
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
 
@@ -351,26 +352,26 @@ def main():
     n_done, n_skipped, n_failed = 0, 0, 0
     t_start = time.time()
 
-    for source_meta_path in source_paths:
+    pbar = tqdm(source_paths, desc="Annotating", unit="file")
+    for source_meta_path in pbar:
         theme = source_meta_path.stem
         output_meta_path = output_dir / f"{theme}.json"
+        pbar.set_postfix(theme=theme, refresh=False)
 
         try:
             if args.skip_existing and output_meta_path.is_file():
                 if args.show:
                     from bbox_visualize import visualize_metadata_file
 
-                    debug_path = visualize_metadata_file(
+                    visualize_metadata_file(
                         output_meta_path,
                         debug_dir=Path(args.debug_dir),
                         show=True,
                     )
-                    print(
-                        f"[{theme}] SKIP annotate; debug overlay -> {debug_path.name}"
-                    )
-                else:
-                    print(f"[{theme}] SKIP: bbox output already exists -> {output_meta_path}")
                 n_skipped += 1
+                pbar.set_postfix(
+                    theme=theme, status="skip", done=n_done, skip=n_skipped, fail=n_failed
+                )
                 continue
 
             theme, found, total, out_path, debug_path = annotate_theme(
@@ -381,19 +382,25 @@ def main():
                 args,
             )
             n_done += 1
-            msg = f"[{theme}] annotated {found}/{total} objects -> {out_path}"
-            if debug_path is not None:
-                msg += f" | debug: {debug_path.name}"
-            print(msg)
+            pbar.set_postfix(
+                theme=theme,
+                status=f"{found}/{total}",
+                done=n_done,
+                skip=n_skipped,
+                fail=n_failed,
+            )
 
         except Exception as e:
             n_failed += 1
-            print(f"[{theme}] ERROR: {e}", file=sys.stderr)
+            pbar.set_postfix(
+                theme=theme, status="error", done=n_done, skip=n_skipped, fail=n_failed
+            )
+            tqdm.write(f"[{theme}] ERROR: {e}", file=sys.stderr)
             traceback.print_exc()
             continue
 
     elapsed = time.time() - t_start
-    print(
+    tqdm.write(
         f"DONE. annotated={n_done} skipped={n_skipped} failed={n_failed} "
         f"output_dir={output_dir} elapsed={elapsed:.1f}s"
     )

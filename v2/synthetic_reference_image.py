@@ -23,9 +23,26 @@ of just that object:
     `objects` list from the bbox metadata, so bbox1.jpg is always the same
     object across runs.
 
-Typical usage:
+Multi-GPU / sharding:
+  Each launch is told:
+    --shard_id      which shard this process handles (0-indexed)
+    --num_shards    total number of shards/GPUs (default: 6)
 
-    CUDA_VISIBLE_DEVICES=0 python synthetic_reference_image.py
+  Samples (bbox metadata files) are assigned via `index % num_shards ==
+  shard_id`, so you can safely run N independent processes in parallel and
+  they will never touch the same sample.
+
+Typical usage (6 GPUs, one process per GPU):
+
+    CUDA_VISIBLE_DEVICES=1 python synthetic_reference_image.py --shard_id 0 --num_shards 6
+    CUDA_VISIBLE_DEVICES=2 python synthetic_reference_image.py --shard_id 1 --num_shards 6
+    CUDA_VISIBLE_DEVICES=3 python synthetic_reference_image.py --shard_id 2 --num_shards 6
+    CUDA_VISIBLE_DEVICES=4 python synthetic_reference_image.py --shard_id 3 --num_shards 6
+    CUDA_VISIBLE_DEVICES=5 python synthetic_reference_image.py --shard_id 4 --num_shards 6
+    CUDA_VISIBLE_DEVICES=6 python synthetic_reference_image.py --shard_id 5 --num_shards 6
+
+    # Or launch all 6 at once:
+    bash run_synthetic_reference_image.sh
 
     # Single sample, smaller GPU:
     CUDA_VISIBLE_DEVICES=0 python synthetic_reference_image.py --theme home_office_000024 --quantized
@@ -39,6 +56,9 @@ Notes:
   - Uses FLUX.2's image-conditioning input (`image=[...]`) the same way
     FLUX.1 Kontext-style pipelines do: the reference crop steers subject
     identity/appearance while the prompt steers pose/background/framing.
+  - --theme and sharding are mutually exclusive in spirit: --theme pins you
+    to a single sample regardless of --shard_id/--num_shards, which is
+    intentional (useful for debugging one sample on one GPU).
 """
 
 import argparse
@@ -90,6 +110,18 @@ def parse_args():
         help="Root directory for generated reference images (organized by sample-id subfolder).",
     )
     p.add_argument(
+        "--shard_id",
+        type=int,
+        default=0,
+        help="0-indexed shard/GPU id this process handles.",
+    )
+    p.add_argument(
+        "--num_shards",
+        type=int,
+        default=6,
+        help="Total number of shards/GPUs (default: 6).",
+    )
+    p.add_argument(
         "--model_id",
         type=str,
         default="black-forest-labs/FLUX.2-dev",
@@ -100,7 +132,12 @@ def parse_args():
         action="store_true",
         help="Load the 4-bit (bnb) quantized transformer + text encoder instead of full bf16. Auto-enables CPU offload.",
     )
-    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help="Device string. Use with CUDA_VISIBLE_DEVICES when launching.",
+    )
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     p.add_argument("--guidance_scale", type=float, default=4.0)
     p.add_argument("--num_inference_steps", type=int, default=4)
@@ -127,7 +164,14 @@ def parse_args():
         "--theme",
         type=str,
         default=None,
-        help="Process only this sample (bbox metadata filename stem, e.g. home_office_000024).",
+        help="Process only this sample (bbox metadata filename stem, e.g. home_office_000024). "
+        "Bypasses sharding entirely.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional cap on number of samples this shard will process (smoke testing).",
     )
     p.add_argument(
         "--skip_existing",
@@ -143,6 +187,14 @@ def parse_args():
     )
     p.add_argument("--jpg_quality", type=int, default=95)
     return p.parse_args()
+
+
+# ----------------------------------------------------------------------------
+# Sharding
+# ----------------------------------------------------------------------------
+
+def shard_meta_paths(meta_paths, shard_id, num_shards):
+    return [m for idx, m in enumerate(meta_paths) if idx % num_shards == shard_id]
 
 
 # ----------------------------------------------------------------------------
@@ -194,7 +246,7 @@ def build_pipeline(args):
         from transformers import Mistral3ForConditionalGeneration
 
         repo_id = args.model_id if "bnb-4bit" in args.model_id else "diffusers/FLUX.2-dev-bnb-4bit"
-        print(f"Loading quantized FLUX.2 ({repo_id}) ...")
+        print(f"[shard {args.shard_id}] Loading quantized FLUX.2 ({repo_id}) ...")
 
         transformer = Flux2Transformer2DModel.from_pretrained(
             repo_id, subfolder="transformer", torch_dtype=torch_dtype, device_map="auto",
@@ -209,7 +261,7 @@ def build_pipeline(args):
     else:
         from diffusers import Flux2Pipeline
 
-        print(f"Loading pipeline {args.model_id} (dtype={args.dtype}) ...")
+        print(f"[shard {args.shard_id}] Loading pipeline {args.model_id} (dtype={args.dtype}) ...")
         pipe = Flux2Pipeline.from_pretrained(args.model_id, torch_dtype=torch_dtype)
         pipe.to(args.device)
 
@@ -275,18 +327,18 @@ def process_sample(meta_path: Path, pipe, args):
         out_meta_path = sample_out_dir / f"bbox{idx}.json"
 
         if args.skip_existing and out_img_path.is_file():
-            print(f"[{sample_id}] bbox{idx} ({object_name}): SKIP, already exists")
+            print(f"[shard {args.shard_id}] [{sample_id}] bbox{idx} ({object_name}): SKIP, already exists")
             n_skipped += 1
             continue
 
         if not obj_entry.get("found"):
-            print(f"[{sample_id}] bbox{idx} ({object_name}): SKIP, not detected in scene")
+            print(f"[shard {args.shard_id}] [{sample_id}] bbox{idx} ({object_name}): SKIP, not detected in scene")
             n_skipped += 1
             continue
 
         score = obj_entry.get("score")
         if score is not None and score < args.min_score:
-            print(f"[{sample_id}] bbox{idx} ({object_name}): SKIP, score {score:.3f} < {args.min_score}")
+            print(f"[shard {args.shard_id}] [{sample_id}] bbox{idx} ({object_name}): SKIP, score {score:.3f} < {args.min_score}")
             n_skipped += 1
             continue
 
@@ -337,11 +389,11 @@ def process_sample(meta_path: Path, pipe, args):
                 )
 
             n_done += 1
-            print(f"[{sample_id}] bbox{idx} ({object_name}): saved -> {out_img_path.name}")
+            print(f"[shard {args.shard_id}] [{sample_id}] bbox{idx} ({object_name}): saved -> {out_img_path.name}")
 
         except Exception as e:
             n_failed += 1
-            print(f"[{sample_id}] bbox{idx} ({object_name}): ERROR: {e}", file=sys.stderr)
+            print(f"[shard {args.shard_id}] [{sample_id}] bbox{idx} ({object_name}): ERROR: {e}", file=sys.stderr)
             traceback.print_exc()
             continue
 
@@ -356,18 +408,29 @@ def main():
         print(f"ERROR: bbox metadata dir not found: {bbox_metadata_dir}", file=sys.stderr)
         sys.exit(1)
 
-    meta_paths = sorted(bbox_metadata_dir.glob("*.json"))
+    all_meta_paths = sorted(bbox_metadata_dir.glob("*.json"))
+
     if args.theme:
+        # --theme pins to a single sample and bypasses sharding, same as before.
         meta_paths = [bbox_metadata_dir / f"{args.theme}.json"]
         if not meta_paths[0].is_file():
             print(f"ERROR: bbox metadata not found for sample: {args.theme}", file=sys.stderr)
             sys.exit(1)
+    else:
+        if not all_meta_paths:
+            print(f"ERROR: no bbox metadata JSON files found in {bbox_metadata_dir}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"[shard {args.shard_id}/{args.num_shards}] Total samples in bbox metadata dir: {len(all_meta_paths)}")
+        meta_paths = shard_meta_paths(all_meta_paths, args.shard_id, args.num_shards)
+        if args.limit is not None:
+            meta_paths = meta_paths[: args.limit]
 
     if not meta_paths:
         print(f"ERROR: no bbox metadata JSON files found in {bbox_metadata_dir}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Samples to process: {len(meta_paths)}")
+    print(f"[shard {args.shard_id}/{args.num_shards}] Samples assigned to this shard: {len(meta_paths)}")
     for meta_path in meta_paths:
         print(f"  - {meta_path.stem}")
 
@@ -387,13 +450,14 @@ def main():
             total_failed += n_failed
         except Exception as e:
             total_failed += 1
-            print(f"[{sample_id}] ERROR: {e}", file=sys.stderr)
+            print(f"[shard {args.shard_id}] [{sample_id}] ERROR: {e}", file=sys.stderr)
             traceback.print_exc()
             continue
 
     elapsed = time.time() - t_start
     print(
-        f"DONE. generated={total_done} skipped={total_skipped} failed={total_failed} "
+        f"[shard {args.shard_id}/{args.num_shards}] DONE. "
+        f"generated={total_done} skipped={total_skipped} failed={total_failed} "
         f"output_dir={args.output_dir} elapsed={elapsed:.1f}s"
     )
 
