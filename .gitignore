@@ -2,3 +2,6 @@
 __pycache__/
 outputs/
 v2/outputs
+v2/smoke_output
+train/RefCompose/scripts/train/output
+v2/logs/

@@ -1,0 +1,3 @@
+# Depth Anything 3 for stage2_depth.py
+#   pip install -r requirements-da3.txt
+depth-anything-3>=0.1.0

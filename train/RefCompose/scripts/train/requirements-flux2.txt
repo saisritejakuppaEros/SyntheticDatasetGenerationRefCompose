@@ -1,0 +1,13 @@
+# FLUX.2 training stack (pin to the diffusers release that ships Flux2Transformer2DModel + Flux2Pipeline).
+# Example: pip install -r requirements-flux2.txt
+torch>=2.1.0
+diffusers>=0.32.0
+transformers>=4.46.0
+accelerate>=0.34.0
+safetensors>=0.4.0
+datasets>=2.14.0
+torchvision>=0.16.0
+einops>=0.7.0
+Pillow>=10.0.0
+tqdm>=4.65.0
+logzero>=1.7.0

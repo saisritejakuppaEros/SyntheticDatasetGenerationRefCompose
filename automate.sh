@@ -4,18 +4,18 @@
 # export CUDA_VISIBLE_DEVICES=1
 
 
-# export NCCL_NVLS_ENABLE=0
-# export NCCL_TREE_THRESHOLD=0
-# export NCCL_NET_GDR_LEVEL=0
-# export NCCL_P2P_LEVEL=SYS
-# export NCCL_SHM_DISABLE=0
-# export NCCL_ALGO=Ring
-# export NCCL_TIMEOUT=1800
-# export NCCL_DEBUG=WARN
-# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+export NCCL_NVLS_ENABLE=0
+export NCCL_TREE_THRESHOLD=0
+export NCCL_NET_GDR_LEVEL=0
+export NCCL_P2P_LEVEL=SYS
+export NCCL_SHM_DISABLE=0
+export NCCL_ALGO=Ring
+export NCCL_TIMEOUT=1800
+export NCCL_DEBUG=WARN
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 \
 uv run vllm serve Qwen/Qwen3-VL-8B-Instruct-FP8 \
   --tensor-parallel-size 1 \
-  --data-parallel-size 1 \
+  --data-parallel-size 6 \
   --limit-mm-per-prompt.video 0 \
   --gpu-memory-utilization 0.95 \
   --enforce-eager

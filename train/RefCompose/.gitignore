@@ -1,0 +1,11 @@
+*.pyc
+train/output
+train/src/__pycache__
+dataset_prep_v2/output/
+dataset_prep_v2/yolo26n.pt
+infer/flux_server/outputs_flux_lora
+infer/flux_server/output_flux_lora
+infer/flux_server/output_depth
+infer/flux_server/output_bg_removed
+models/
+benchmarking/
